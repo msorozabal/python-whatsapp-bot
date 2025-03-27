@@ -4,10 +4,15 @@ import logging
 import requests
 import json
 from datetime import datetime
+from dotenv import load_dotenv
+import os 
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+load_dotenv()
+
 
 # Script content exacto del PDF
 SCRIPT_CONTENT = {
@@ -56,7 +61,7 @@ EXAMPLE_IMAGES = {
 # ------------------------------------------------------------------------
 # CONFIGURACIÓN DE SLACK
 # ------------------------------------------------------------------------
-SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/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"
+SLACK_WEBHOOK_URL = os.getenv("WEBHOOK_SLACK")
 
 def post_to_slack_onboarding(username, phone_number, webhook_url=SLACK_WEBHOOK_URL):
     """

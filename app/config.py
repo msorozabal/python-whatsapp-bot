@@ -14,6 +14,7 @@ def load_configurations(app):
     app.config["VERSION"] = os.getenv("VERSION")
     app.config["PHONE_NUMBER_ID"] = os.getenv("PHONE_NUMBER_ID")
     app.config["VERIFY_TOKEN"] = os.getenv("VERIFY_TOKEN")
+    app.config["WEBHOOK_SLACK"] = os.getenv("WEBHOOK_SLACK")
 
 
 def configure_logging():
