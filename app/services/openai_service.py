@@ -9,11 +9,11 @@ logger = logging.getLogger(__name__)
 # Script content exacto del PDF
 SCRIPT_CONTENT = {
     "ONBOARDING": [
-        "Hola, {name} te saludamos de Eficacia. Para comenzar con el proceso de registro necesitamos validar tus datos. Por favor me puedes enviar una foto de tu cédula (frente y reverso).",
+        "Para comenzar con el proceso de registro necesitamos validar tus datos. Por favor me puedes enviar una foto de tu cédula (frente y reverso).",
         "Gracias, me ayudas a contestar estas preguntas porfa?\n¿Para qué cliente de Eficacia trabajas?\n¿Visitas principalmente supermercados o tiendas de barrio?"
     ],
     "CANAL_TRADICIONAL": [
-        "👋Hola, {name}! Soy Pastor de Kapta. Necesito tu apoyo para tomar algunas fotos en las tiendas que visitas. 📸",
+        "👋Hola, {name}! Soy Pastor de Kapta. Necesito tu apoyo para tomar algunas fotos en las tiendas que visitas, deseas continuar?. 📸",
         "Para empezar, ¿me puedes por favor compartir la dirección y el nombre de la tienda donde iniciarás el registro?\n\nEjemplo:\n📌 Surtifruver Lucey\n📌 Carrera 78F #58 sur - 48, Bosa",
         "Se por Eficacia que visitas tiendas de barrio, dime con solo el número en que tipo de tienda estas: ✏️\n\n1️⃣ Tienda de barrio\nNegocio con mostrador, donde los productos no están al alcance del cliente.\n2️⃣ Supermercado de barrio\nTienda con góndolas y estanterías donde los productos están al alcance, con al menos una caja de pago.\n3️⃣ Licorera/Estanco\nEspecializada en licores, también vende gaseosas como mezclador.\n4️⃣ Panadería\nVende pan, pasteles y productos recién horneados.\n5️⃣ Farmacia\nVenta de medicamentos y productos de cuidado personal.",
         "¡Ahora ayúdame con la primera foto!📸\nToma una foto de la fachada de la tienda. Es importante que se vea el nombre y la entrada.",
@@ -21,7 +21,7 @@ SCRIPT_CONTENT = {
         "🥤 ¡Hagámoslo con las bebidas sin alcohol!\nAbre la neveras y toma 3 fotos donde se vea:\n✅Gaseosas\n✅Aguas\n✅Jugos\n✅Té helado\n✅Bebidas energéticas\n✅Bebidas hidratantes",
         "🍪Sigamos con 3 fotos de la sección de snacks.\nIncluye todos los productos disponibles en la tienda:\n✅Papas fritas\n✅Galletas\n✅Ponqués\n✅Gomas de mascar\n✅Chocolates",
         "🥚 Ahora, toma 3 fotos de la sección de huevos.\nAsegúrate de capturar toda la variedad disponible en la tienda, incluyendo:\n✅Huevos blancos y rojos\n✅Diferentes presentaciones (bandejas, por unidad, etc.)",
-        "🚬 Vamos con la sección de cigarrillos y vapes.\nToma 3 fotos asegurándote de incluir:\n✅Cigarrillos de diferentes marcas\n✅Vapes y cigarrillos electrónicos (si hay disponibles),
+        "🚬 Vamos con la sección de cigarrillos y vapes.\nToma 3 fotos asegurándote de incluir:\n✅Cigarrillos de diferentes marcas\n✅Vapes y cigarrillos electrónicos (si hay disponibles)",
         "🧴 Ahora, toma 3 fotos de la sección de cuidado personal.\nIncluye productos como:\n✅Shampoo\n✅Tinte para el cabello\n✅Pañales\n✅Cuchillas de afeitar\n✅Cepillos de dientes\n✅Enjuague bucal",
         "🎤 Por último, enviame un audio respondiendo estas preguntas o algo adicional que quieras comentarme sobre el punto de venta.\n\n¿Hay espacios vacíos en los estantes?\n¿Faltan ciertas marcas o productos?\n¿Las promociones están bien visibles?\n¿Los productos están bien organizados?",
         "✅ ¡Gracias {name} por compartir toda la información! Avisame cuando ya estes en la otra tienda."
