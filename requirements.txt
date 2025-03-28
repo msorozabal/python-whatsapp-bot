@@ -3,3 +3,4 @@ python-dotenv
 openai
 aiohttp
 requests
+google-cloud-storage

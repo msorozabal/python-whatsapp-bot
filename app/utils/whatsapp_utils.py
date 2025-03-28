@@ -1,3 +1,4 @@
+# Archivo: whatsapp_handler.py (por ejemplo)
 import logging
 from flask import current_app, jsonify
 import json
@@ -33,7 +34,6 @@ def send_message(data):
         "Content-type": "application/json",
         "Authorization": f"Bearer {current_app.config['ACCESS_TOKEN']}",
     }
-
     url = f"https://graph.facebook.com/{current_app.config['VERSION']}/{current_app.config['PHONE_NUMBER_ID']}/messages"
     
     try:
@@ -46,8 +46,8 @@ def send_message(data):
 
 def process_text_for_whatsapp(text):
     """Formatear texto para WhatsApp"""
-    text = re.sub(r"\*\*(.*?)\*\*", r"*\1*", text)  # Convertir **texto** a *texto*
-    text = re.sub(r"【.*?】", "", text)  # Eliminar texto entre 【】
+    text = re.sub(r"\*\*(.*?)\*\*", r"*\1*", text)
+    text = re.sub(r"【.*?】", "", text)
     return text.strip()
 
 def determine_message_type(message):
@@ -74,6 +74,23 @@ def is_valid_whatsapp_message(body):
         and body["entry"][0]["changes"][0]["value"]["messages"][0]
     )
 
+def get_media_url(media_id):
+    """
+    Obtener la URL real de la imagen a partir del media_id
+    usando la API de Facebook/WhatsApp.
+    """
+    url = f"https://graph.facebook.com/{current_app.config['VERSION']}/{media_id}"
+    params = {'access_token': current_app.config['ACCESS_TOKEN']}
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        logging.info(f"Respuesta de Graph API para media_id={media_id}: {data}")
+        return data.get('url')
+    except Exception as e:
+        logging.error(f"Error fetching media URL: {e}")
+        return None
+
 def process_whatsapp_message(body):
     """Procesar mensaje entrante de WhatsApp"""
     if not is_valid_whatsapp_message(body):
@@ -89,21 +106,37 @@ def process_whatsapp_message(body):
     message_content = None
     if message_type == "text":
         message_content = message["text"]["body"]
+
     elif message_type == "image":
-        message_content = "[Image sent]"
+        media_id = message["image"].get("id")
+        media_url = get_media_url(media_id) if media_id else None
+        if media_url:
+            message_content = media_url
+        else:
+            message_content = "[Image sent]"
         if "caption" in message["image"]:
-            message_content += f" Caption: {message['image']['caption']}"
+            caption = message["image"]["caption"]
+            logging.info(f"Image caption: {caption}")
+
     elif message_type == "audio":
         message_content = "[Audio message sent]"
+
     elif message_type == "location":
-        message_content = "[Location shared]"
+        # Extraer los datos de ubicación del mensaje
+        loc = message.get("location", {})
+        message_content = {
+            "latitude": loc.get("latitude"),
+            "longitude": loc.get("longitude"),
+            "name": loc.get("name", ""),
+            "address": loc.get("address", "")
+        }
     else:
         message_content = "[Unsupported message type]"
     
-    # Obtener respuesta basada en el script
+    # Obtener respuesta basada en el script/servicio
     response = generate_response(wa_id, name, message_type, message_content)
     
-    # Enviar respuesta de texto
+    # Enviar respuesta de texto (si existe)
     if "text_response" in response and response["text_response"]:
         text_response = process_text_for_whatsapp(response["text_response"])
         data = get_text_message_input(wa_id, text_response)
