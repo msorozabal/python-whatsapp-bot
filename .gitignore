@@ -89,4 +89,4 @@ target/
 .mypy_cache/
 
 # Exlcude the database file
-.db
+.dbkapta-service-account.json
