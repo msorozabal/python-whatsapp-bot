@@ -4,3 +4,5 @@ openai
 aiohttp
 requests
 google-cloud-storage
+streamlit 
+pandas

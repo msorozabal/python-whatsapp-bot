@@ -13,11 +13,17 @@ from google.cloud import storage
 # Para cargar variables de entorno
 from dotenv import load_dotenv
 
+# Importar MessageHandler para la integración con Streamlit
+from app.utils.message_handler import MessageHandler
+
 # Cargar .env
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Inicializar el MessageHandler para la integración con Streamlit
+message_handler = MessageHandler()
 
 # ------------------------------------------------------------------------
 # 1. CONFIGURACIÓN GCS
@@ -277,7 +283,7 @@ class ConversationState:
         self.channel = channel
         self.current_step = current_step
         self.step_index = step_index
-        self.data = {}           # Aquí se almacenan datos adicionales: store_name, store_address, store_location, etc.
+        self.data = {}  # Datos adicionales: store_name, store_address, store_location, etc.
         self.photo_counts = {}
         self.onboarding_notified = False
         self.new_store_notified = False
@@ -340,7 +346,6 @@ class ConversationState:
 
     def advance_step(self):
         script = self.get_current_script()
-        # Si estamos en ONBOARDING y ya se ha enviado el mensaje de respuesta, cambiar de canal
         if self.current_step == "ONBOARDING" and self.step_index == 1:
             user_response = self.data.get('onboarding_response', '').lower()
             if "supermercados" in user_response:
@@ -351,7 +356,6 @@ class ConversationState:
             self.step_index = 0
             self.photo_counts = {}
             return
-
         if self.step_index < len(script) - 1:
             self.step_index += 1
             self.photo_counts = {}
@@ -362,21 +366,16 @@ class ConversationState:
                 self.notify_end_of_flow()
 
     def process_message(self, message_type, content=None):
-        """
-        Procesa el mensaje recibido y realiza acciones según el paso del flujo.
-        """
         # ---------------------------
         # ONBOARDING
         # ---------------------------
         if self.current_step == "ONBOARDING":
             if self.step_index == 0:
-                # Paso 0 => Foto de cédula
                 if message_type == "image" and content:
                     self._upload_onboarding_image(content)
                     self.advance_step()
                     return True
             elif self.step_index == 1:
-                # Paso 1 => Texto (respuesta de onboarding)
                 if message_type == "text":
                     self.data['onboarding_response'] = content
                     if not self.new_store_notified:
@@ -392,21 +391,18 @@ class ConversationState:
                 self.advance_step()
                 return True
             elif self.step_index == 1:
-                # Paso 1 => Nombre de la tienda
                 if message_type == "text":
                     self.data['store_name'] = content.strip()
                     self._upload_conversation_json()
                     self.advance_step()
                     return True
             elif self.step_index == 2:
-                # Paso 2 => Dirección de la tienda
                 if message_type == "text":
                     self.data['store_address'] = content.strip()
                     self._upload_conversation_json()
                     self.advance_step()
                     return True
             elif self.step_index == 3:
-                # Paso 3 => Ubicación actual
                 if message_type in ("location", "text"):
                     loc = {}
                     if isinstance(content, dict):
@@ -427,7 +423,6 @@ class ConversationState:
                         logger.info("No se detectó latitud/longitud. Por favor, envía la ubicación de WhatsApp.")
                         return False
             elif self.step_index >= 4:
-                # Paso 4 en adelante => Fotos de secciones
                 sections = [
                     'fachada', 'bebidas_alcoholicas', 'bebidas_no_alcoholicas',
                     'snacks', 'huevos', 'cigarrillos', 'cuidado_personal', 'audio'
@@ -435,7 +430,7 @@ class ConversationState:
                 idx = self.step_index - 4
                 if idx < len(sections):
                     section = sections[idx]
-                    if message_type == ("audio" if section=="audio" else "image"):
+                    if message_type == ("audio" if section == "audio" else "image"):
                         if section != "audio" and content:
                             if section == "fachada":
                                 self._upload_fachada_image(content)
@@ -463,21 +458,18 @@ class ConversationState:
                 self.advance_step()
                 return True
             elif self.step_index == 1:
-                # Paso 1 => Nombre de la tienda
                 if message_type == "text":
                     self.data['store_name'] = content.strip()
                     self._upload_conversation_json()
                     self.advance_step()
                     return True
             elif self.step_index == 2:
-                # Paso 2 => Dirección de la tienda
                 if message_type == "text":
                     self.data['store_address'] = content.strip()
                     self._upload_conversation_json()
                     self.advance_step()
                     return True
             elif self.step_index == 3:
-                # Paso 3 => Ubicación actual
                 if message_type in ("location", "text"):
                     logger.info(f"Ubicación recibida: {content}")
                     loc = {}
@@ -493,7 +485,6 @@ class ConversationState:
                     if lat is None or lng is None:
                         logger.info("No se detectaron latitud y/o longitud. Envía la ubicación real de WhatsApp.")
                         return False
-                    # Si faltan nombre o dirección en la ubicación, no avanzar
                     if not loc.get("name") or not loc.get("address"):
                         logger.info("Falta nombre y/o dirección en la ubicación. Por favor, envía un mensaje de texto con 'Nombre: X, Dirección: Y'.")
                         return False
@@ -507,7 +498,6 @@ class ConversationState:
                     self.advance_step()
                     return True
             elif self.step_index >= 4:
-                # Paso 4 en adelante => Fotos de secciones
                 sections = [
                     'bebidas_alcoholicas', 'bebidas_no_alcoholicas',
                     'snacks', 'huevos', 'cigarrillos', 'cuidado_personal', 'audio'
@@ -515,7 +505,7 @@ class ConversationState:
                 idx = self.step_index - 4
                 if idx < len(sections):
                     section = sections[idx]
-                    if message_type == ("audio" if section=="audio" else "image"):
+                    if message_type == ("audio" if section == "audio" else "image"):
                         if section != "audio" and content:
                             self._upload_product_image(content, section)
                             self.photo_counts[section] = self.photo_counts.get(section, 0) + 1
@@ -530,9 +520,6 @@ class ConversationState:
 
         return False
 
-    # -----------------------------------------------------
-    # Métodos privados para subir imágenes + JSON
-    # -----------------------------------------------------
     def _maybe_notify_new_store(self, content):
         cliente = "No especificado"
         visita = "No especificado"
@@ -612,7 +599,9 @@ def generate_response(wa_id, name, message_type, message_content=None):
 
     except Exception as e:
         logger.error(f"Error crítico en generate_response: {e}")
+        error_response = f"Hola {name}, estamos experimentando problemas técnicos. Por favor, intenta más tarde."
+        message_handler.add_message(wa_id, error_response, is_bot=True)
         return {
-            'text_response': f"Hola {name}, estamos experimentando problemas técnicos. Por favor, intenta más tarde.",
+            'text_response': error_response,
             'force_script': True
         }
