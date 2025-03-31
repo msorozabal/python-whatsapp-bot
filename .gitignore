@@ -22,7 +22,6 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
-kapta-service-accountjson
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -90,3 +89,5 @@ target/
 
 # Exlcude the database file
 .dbkapta-service-account.json
+.kapta-service-account.json
+*.json
