@@ -1,53 +1,328 @@
 import shelve
-from flask import current_app
 import logging
 import requests
 import json
-from datetime import datetime
-import uuid
 import os
-
-# Google Cloud
+import time
+import sys
+import re
+import random
+import uuid
+from datetime import datetime
+from google.cloud import documentai_v1 as documentai
 from google.cloud import storage
-
-# Para cargar variables de entorno
+from openai import OpenAI
+from flask import current_app
 from dotenv import load_dotenv
-
-# Importar MessageHandler para la integración con Streamlit
 from app.utils.message_handler import MessageHandler
 
-# Cargar .env
+# Cargar variables de entorno
 load_dotenv()
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Inicializar el MessageHandler para la integración con Streamlit
+# Inicializar handler de mensajes
 message_handler = MessageHandler()
 
 # ------------------------------------------------------------------------
-# 1. CONFIGURACIÓN GCS
+# CONFIGURACIÓN INICIAL
 # ------------------------------------------------------------------------
-creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "./kapta-service-account.json")
+# Verificar que las API keys existen
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
+GCP_LOCATION = os.getenv("GCP_LOCATION", "us")  # Default: us
+DOCAI_PROCESSOR_ID = os.getenv("GCP_DOCAI_PROCESSOR_ID", "")
+
+creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+
 client = storage.Client.from_service_account_json(creds_path)
-GCS_BUCKET_NAME = "kapta-bucket"  # Cámbialo si es distinto
+GCS_BUCKET_NAME = os.getenv("GCP_BUCKET_NAME", "kapta-bucket")
+
+print(creds_path)
+
+if not all([OPENAI_API_KEY, GCP_PROJECT_ID, DOCAI_PROCESSOR_ID, GCS_BUCKET_NAME]):
+    logger.error("ERROR CRÍTICO: Faltan variables de entorno esenciales")
+
+# Inicializar clientes
+try:
+    # OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    # Don't call models.list() here - it's causing problems in your initialization
+    logger.info(f"Cliente OpenAI inicializado correctamente")
+    
+    # Set up explicit credentials for Google Cloud
+    import os
+    from google.oauth2 import service_account
+    
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not credentials_path:
+        logger.error("GOOGLE_APPLICATION_CREDENTIALS no está configurado")
+        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS environment variable is required")
+    
+    credentials = service_account.Credentials.from_service_account_file(credentials_path)
+    
+    # Google Document AI with explicit project and credentials
+    docai_client = documentai.DocumentProcessorServiceClient(credentials=credentials)
+    logger.info(f"Cliente Document AI inicializado correctamente")
+    
+    # Google Cloud Storage with explicit project and credentials
+    storage_client = storage.Client(
+        project=GCP_PROJECT_ID,
+        credentials=credentials
+    )
+    bucket = storage_client.bucket(GCS_BUCKET_NAME)
+    logger.info(f"Cliente Cloud Storage inicializado correctamente para bucket {GCS_BUCKET_NAME}")
+    
+except Exception as e:
+    logger.error(f"ERROR inicializando clientes: {e}", exc_info=True)
+    # Set clients to None so you can check for this later
+    docai_client = None
+    storage_client = None
+    bucket = None
+    
+# ------------------------------------------------------------------------
+# GESTIÓN DE CONVERSACIONES
+# ------------------------------------------------------------------------
+def get_conversation_history(wa_id):
+    """Obtiene el historial de conversación para un usuario de WhatsApp"""
+    with shelve.open("conversation_history") as history_shelf:
+        return history_shelf.get(wa_id, [])
+
+def store_conversation_history(wa_id, history):
+    """Almacena el historial de conversación para un usuario de WhatsApp"""
+    with shelve.open("conversation_history", writeback=True) as history_shelf:
+        history_shelf[wa_id] = history
+
+def get_user_data(wa_id):
+    """Obtiene los datos del usuario"""
+    with shelve.open("user_data") as data_shelf:
+        return data_shelf.get(wa_id, {})
+
+def store_user_data(wa_id, data):
+    """Almacena los datos del usuario"""
+    with shelve.open("user_data", writeback=True) as data_shelf:
+        data_shelf[wa_id] = data
 
 # ------------------------------------------------------------------------
-# 2. FUNCIONES PARA SUBIR A GCS
+# PROCESAMIENTO DE DOCUMENTOS CON DOCUMENT AI
+# ------------------------------------------------------------------------
+def process_document_with_docai(image_bytes, mime_type="image/jpeg"):
+    """
+    Procesa un documento usando Document AI para extraer texto y datos estructurados
+    
+    Args:
+        image_bytes: Bytes de la imagen/documento a procesar
+        mime_type: Tipo MIME del documento (default: image/jpeg)
+        
+    Returns:
+        Dict con los datos extraídos y el texto completo
+    """
+    if not docai_client:
+        logger.error("El cliente Document AI no está inicializado")
+        return {
+            "success": False,
+            "error": "Cliente Document AI no inicializado"
+        }
+        
+    try:
+        # Configurar el request para Document AI
+        name = f"projects/{GCP_PROJECT_ID}/locations/{GCP_LOCATION}/processors/{DOCAI_PROCESSOR_ID}"
+        
+        # Create the raw document
+        raw_document = documentai.RawDocument(
+            content=image_bytes,
+            mime_type=mime_type
+        )
+        
+        # Create the request
+        request = documentai.ProcessRequest(
+            name=name,
+            raw_document=raw_document
+        )
+        
+        # Log que estamos procesando el documento
+        logger.info(f"Procesando documento con Document AI (mime_type: {mime_type}, bytes: {len(image_bytes)})")
+        
+        # Procesar el documento
+        result = docai_client.process_document(request=request)
+        document = result.document
+        
+        # Extraer texto
+        text = document.text
+        logger.info(f"Documento procesado con éxito. Texto extraído: {len(text)} caracteres")
+        
+        # Extraer entidades (campos específicos)
+        entities = {}
+        for entity in document.entities:
+            entities[entity.type_] = entity.mention_text
+            
+        return {
+            "success": True,
+            "text": text,
+            "entities": entities,
+            "full_document": {
+                "text": document.text,
+                "pages": [{
+                    "page_number": page.page_number,
+                    "dimensions": {
+                        "width": page.dimension.width,
+                        "height": page.dimension.height
+                    },
+                    "layout": {
+                        "text": page.layout.text,
+                        "confidence": page.layout.confidence
+                    }
+                } for page in document.pages],
+                "entities": [{
+                    "type": entity.type_,
+                    "mention_text": entity.mention_text,
+                    "confidence": entity.confidence
+                } for entity in document.entities]
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error procesando documento con Document AI: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+# ------------------------------------------------------------------------
+# INTEGRACIÓN CON CLOUD STORAGE
+# ------------------------------------------------------------------------
+def upload_to_gcs(data, destination_blob_name, content_type="application/json"):
+    """
+    Sube datos a Google Cloud Storage
+    
+    Args:
+        data: Datos a subir (pueden ser bytes o string)
+        destination_blob_name: Nombre del archivo en GCS (incluye path)
+        content_type: Tipo MIME del contenido
+        
+    Returns:
+        URL pública del archivo subido o None si falla
+    """
+    try:
+        blob = bucket.blob(destination_blob_name)
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        blob.upload_from_string(data, content_type=content_type)
+        # Hacer el blob públicamente accesible (opcional)
+        blob.make_public()
+        logger.info(f"Archivo {destination_blob_name} subido exitosamente a GCS")
+        return blob.public_url
+    except Exception as e:
+        logger.error(f"Error subiendo a GCS: {e}")
+        return None
+
+def save_conversation_to_cloud(wa_id, conversation_id):
+    """
+    Guarda toda la información de la conversación en Cloud Storage
+    
+    Args:
+        wa_id: ID de WhatsApp del usuario
+        conversation_id: ID único de la conversación
+        
+    Returns:
+        Dict con las URLs de los archivos guardados
+    """
+    try:
+        # Obtener datos del usuario y el historial de conversación
+        user_data = get_user_data(wa_id)
+        conversation_history = get_conversation_history(wa_id)
+        
+        if not user_data:
+            logger.warning(f"No hay datos de usuario para {wa_id}")
+            return None
+            
+        # Crear estructura de datos completa
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        date_str = datetime.now().strftime("%Y%m%d")
+        
+        save_data = {
+            "metadata": {
+                "wa_id": wa_id,
+                "conversation_id": conversation_id,
+                "timestamp": timestamp,
+                "date": datetime.now().isoformat()
+            },
+            "user_data": user_data,
+            "conversation_history": conversation_history
+        }
+        
+        # Construir el path usando el número de teléfono y la combinación de conversation_id + fecha
+        base_path = f"{wa_id}/{conversation_id}_{date_str}"
+        
+        # 1. Guardar JSON principal con los datos estructurados
+        json_data = json.dumps(save_data, indent=2, ensure_ascii=False)
+        json_path = f"{base_path}/data.json"
+        json_url = upload_to_gcs(json_data, json_path)
+        
+        # 2. Guardar imágenes (si existen)
+        image_urls = []
+        if "images" in user_data:
+            for idx, image_info in enumerate(user_data["images"]):
+                image_bytes = download_image_bytes(image_info["url"])
+                if image_bytes:
+                    image_path = f"{base_path}/images/image_{idx}.jpg"
+                    image_url = upload_to_gcs(image_bytes, image_path, "image/jpeg")
+                    if image_url:
+                        image_urls.append(image_url)
+                        # Actualizar URL en el user_data para referencia futura
+                        user_data["images"][idx]["gcs_url"] = image_url
+        
+        # 3. Guardar audios (si existen)
+        audio_urls = []
+        if "audio_messages" in user_data:
+            for idx, audio_info in enumerate(user_data["audio_messages"]):
+                if "url" in audio_info:
+                    audio_bytes = download_image_bytes(audio_info["url"])
+                    if audio_bytes:
+                        # Asegurarse que el directorio de audios existe en Cloud Storage
+                        audio_path = f"{base_path}/audios/audio_{idx}.mp3"
+                        audio_url = upload_to_gcs(audio_bytes, audio_path, "audio/mpeg")
+                        if audio_url:
+                            audio_urls.append(audio_url)
+                            # Actualizar URL en el user_data para referencia futura
+                            user_data["audio_messages"][idx]["gcs_url"] = audio_url
+                            
+                            # Guardar la entrada en la base de datos para mostrar en el dashboard
+                            with shelve.open("conversation_history", writeback=True) as history_shelf:
+                                # Buscar el mensaje correspondiente y actualizarlo con la URL de audio
+                                if wa_id in history_shelf:
+                                    for msg in history_shelf[wa_id]:
+                                        if msg.get("role") == "user" and "[🎤 Audio recibido]" in msg.get("content", ""):
+                                            # Actualizar el mensaje con referencia a la URL de GCS
+                                            msg["audio_url"] = audio_url
+                                    # Guardar la historia actualizada
+                                    history_shelf[wa_id] = history_shelf[wa_id]
+        
+        # Actualizar user_data con las URLs de GCS
+        store_user_data(wa_id, user_data)
+        
+        return {
+            "json_url": json_url,
+            "image_urls": image_urls,
+            "audio_urls": audio_urls,
+            "gcs_path": f"gs://{GCS_BUCKET_NAME}/{base_path}"
+        }
+    except Exception as e:
+        logger.error(f"Error guardando conversación en cloud: {e}")
+        return None
+# ------------------------------------------------------------------------
+# FUNCIONALIDAD PARA DESCARGAR IMÁGENES
 # ------------------------------------------------------------------------
 def download_image_bytes(image_url):
-    """
-    Descarga la imagen desde 'image_url' y retorna los bytes.
-    Intenta incluir el header de autorización si ACCESS_TOKEN está definido en current_app.
-    """
+    """Descarga una imagen desde una URL y retorna sus bytes"""
     headers = {}
     try:
-        token = current_app.config.get('ACCESS_TOKEN')
+        token = current_app.config.get("ACCESS_TOKEN")
         if token:
             headers["Authorization"] = f"Bearer {token}"
-    except Exception as e:
-        logger.error(f"Error accediendo a current_app config: {e}")
+    except Exception:
+        pass
+
     try:
+        logger.info(f"[download_image_bytes] Descargando: {image_url}")
         resp = requests.get(image_url, headers=headers, timeout=10)
         resp.raise_for_status()
         return resp.content
@@ -55,553 +330,320 @@ def download_image_bytes(image_url):
         logger.error(f"No se pudo descargar la imagen {image_url}: {e}")
         return b""
 
-def upload_bytes_to_gcs(destination_blob_name, file_bytes, content_type="image/jpeg"):
-    """
-    Sube 'file_bytes' al bucket 'GCS_BUCKET_NAME' en la ruta 'destination_blob_name'.
-    Retorna la URL del blob (si el bucket es público).
-    """
-    bucket = client.bucket(GCS_BUCKET_NAME)
-    blob = bucket.blob(destination_blob_name)
-    blob.upload_from_string(file_bytes, content_type=content_type)
-    logger.info(f"Subido gs://{GCS_BUCKET_NAME}/{destination_blob_name}")
-    return blob.public_url
+# ------------------------------------------------------------------------
+# PROMPT DE SISTEMA
+# ------------------------------------------------------------------------
+SYSTEM_PROMPT = """Eres un asistente que permite a los usuarios capturar datos en Tiendas de Barrio o Supermercados. 
+Agrega emojis para hacer más divertida la conversación de WhatsApp.
 
-def upload_json_to_gcs(destination_blob_name, data_dict):
-    """
-    Sube 'data_dict' como un archivo JSON al bucket 'GCS_BUCKET_NAME'.
-    """
-    bucket = client.bucket(GCS_BUCKET_NAME)
-    blob = bucket.blob(destination_blob_name)
-    json_str = json.dumps(data_dict, ensure_ascii=False, indent=2)
-    blob.upload_from_string(json_str, content_type="application/json")
-    logger.info(f"JSON subido gs://{GCS_BUCKET_NAME}/{destination_blob_name}")
-    return blob.public_url
+1. Lo primero que haces es un Registro de Onboarding Preguntando al usuario si ya está registrado en Kapta o no. 
+
+1.1 Si el usuario responde que no, se le solicita la Cédula Frontal, Parte detrás, Ciudad, y Cliente en un mensaje. Agrega el estilo de un mensaje copado de WhatsApp, escribe los datos en un JSON local. 
+
+Se le indica al usuario que cuando finalice envíe Listo como para confirmar, validar que está listo por detrás, es decir que el usuario envió la información total solicitada. 
+
+Si se envió la información completa se avanza en el flujo, sino se le pide lo que falte al usuario. 
+
+1.2 Si el usuario dice que ya está registrado avanzamos a: 
+
+Para empezar, envíame el nombre de la tienda que vamos a capturar.
+
+📝 Ejemplos: Éxito La Felicidad o Supermercado Doña Luz
+
+Dependiendo de si el Usuario dice algo parecido a: 
+Tiendas que son consideradas canal moderno:
+D1
+Ara
+Éxito
+Carulla
+Alkosto
+Olimpica
+Sao
+Jumbo
+Metro
+Makro
+Farmatodo
+Locatel
+
+Ahí asignamos Canal Moderno y seguimos el siguiente flujo:
+
+📍 Continuemos con la ubicación de la tienda.
+
+Para enviarnos tu ubicación:
+ 1. Abre el chat.
+ 2. Pulsa el ícono de adjuntar "📎".
+ 3. Selecciona "Ubicación" y elige "Enviar mi ubicación actual".
+
+Luego de que el usuario WhatsApp envíe la ubicación le pedimos:
+
+📸 ¡Momento de capturar las fotos!
+
+🔍 Lo más importante es que podamos identificar la mayor cantidad de productos posibles de forma clara.
+
+📌 Para lograrlo, ten en cuenta:
+✅ Toma la foto de frente y a la altura de los ojos.
+✅ Asegúrate de que haya buena iluminación.
+✅ Si hay neveras, ábrela antes de tomar la foto para evitar reflejos en el vidrio.
+✅ Si hay publicidad o elementos que cubran los productos, trata de capturarlos de una forma en la que sean visibles.
+✅ Si hay muchos productos, divide la sección en varias fotos para que todo quede bien registrado.
+
+Cada detalle cuenta, empezaremos con tu categoría y agrega Listo luego de haber tomado las fotos. ¡Gracias por el esfuerzo! 🚀📷
+
+Finalmente luego de que el usuario capturó las fotos y mandó Listo como confirmación
+Enviamos el siguiente Mensaje: 
+
+🎤 Por último, envíame un audio contándome cómo ves el desempeño de tu marca y de la competencia en esta tienda dentro de la categoría.
+
+💡 Queremos conocer qué marcas están mejor posicionadas, cuáles tienen más visibilidad, si hay promociones atractivas o algo que pueda mejorar tu marca en esta tienda versus la competencia. ¡Tu opinión es clave para ayudar a mejorar! Envía Listo cuando hayas terminado. 
+
+Luego de que el usuario envíe Listo, finalmente lo despedimos y guardamos un JSON que tenga toda la información del chat capturada.
+
+# Output Format
+- Responder en español conversacional con muchos emojis adecuados
+- NUNCA incluir estructuras JSON o bloques de código en la respuesta visible
+- Mantener mensajes concisos pero amigables y atractivos
+- Usar emojis para resaltar información importante y hacer la conversación divertida
+
+# Notas importantes
+- Asegurar que cada mensaje del usuario sea reconocido con una respuesta amigable
+- Validar que la información esté completa antes de pasar al siguiente paso
+- Mantener interacciones amigables y atractivas durante todo el proceso
+- NUNCA mostrar detalles técnicos o datos JSON al usuario
+- Reemplazar {name} con el nombre del usuario y {agent_name} con "Kapta Assistant" cuando uses esas plantillas"""
 
 # ------------------------------------------------------------------------
-# 3. SCRIPT Y EJEMPLOS
+# LLAMAR A LA API DE OPENAI
 # ------------------------------------------------------------------------
-"""
-La secuencia para ambos canales es la siguiente:
-  PASO 0: Mensaje inicial.
-  PASO 1: Nombre de la tienda.
-  PASO 2: Dirección de la tienda.
-  PASO 3: Ubicación actual (mensaje de tipo location de WhatsApp).
-  PASO 4 en adelante: Se piden las fotos (para fachada y otras secciones).
-"""
-
-SCRIPT_CONTENT = {
-    "ONBOARDING": [
-        "Para comenzar con el proceso de registro necesitamos validar tus datos. Por favor envíame una foto de tu cédula (frente y reverso).",
-        "Gracias, ¿me ayudas a contestar estas preguntas?\n¿Para qué cliente de Eficacia trabajas?\n¿Visitas principalmente supermercados o tiendas de barrio?"
-    ],
-    "CANAL_TRADICIONAL": [
-        "👋Hola, {name}! Estoy listo para registrar la tienda. ¿Listo?",
-        "Por favor, envíame *el nombre de la tienda*.",
-        "Excelente. Ahora envíame *la dirección de la tienda*.",
-        "Perfecto, ahora compárteme la *ubicación actual de la tienda* (mensaje de tipo location).",
-        "Ahora, envíame una foto de la fachada de la tienda (1 foto requerida).",
-        "🥃 Toma 3 fotos de la sección de bebidas alcohólicas...",
-        "🥤 Envía 3 fotos de las bebidas sin alcohol...",
-        "🍪 Manda 3 fotos de la sección de snacks...",
-        "🥚 Envía 3 fotos de la sección de huevos...",
-        "🚬 Toma 3 fotos de la sección de cigarrillos...",
-        "🧴 Envía 3 fotos de la sección de cuidado personal...",
-        "🎤 Por último, envía un audio.",
-        "✅ ¡Gracias {name} por compartir toda la información!"
-    ],
-    "CANAL_MODERNO": [
-        "👋Hola, {name}! Estoy listo para registrar la tienda. ¿Listo?",
-        "Por favor, envíame *el nombre de la tienda*.",
-        "Excelente. Ahora envíame *la dirección de la tienda*.",
-        "Perfecto, ahora compárteme la *ubicación actual de la tienda* (mensaje de tipo location).",
-        "Ahora, envíame una foto de la fachada de la tienda (1 foto requerida).",
-        "🥃 Toma 3 fotos de la sección de bebidas alcohólicas...",
-        "🥤 Envía 3 fotos de las bebidas sin alcohol...",
-        "🍪 Manda 3 fotos de la sección de snacks...",
-        "🥚 Envía 3 fotos de la sección de huevos...",
-        "🚬 Toma 3 fotos de la sección de cigarrillos...",
-        "🧴 Envía 3 fotos de la sección de cuidado personal...",
-        "🎤 Por último, envía un audio.",
-        "✅ ¡Gracias {name} por compartir toda la información!"
-    ]
-}
-
-EXAMPLE_IMAGES = {
-    "fachada": "https://example.com/images/fachada.jpg",
-    "bebidas_alcoholicas": "https://example.com/images/bebidas_alcoholicas.jpg",
-    "bebidas_no_alcoholicas": "https://example.com/images/bebidas_no_alcoholicas.jpg",
-    "snacks": "https://example.com/images/snacks.jpg",
-    "huevos": "https://example.com/images/huevos.jpg",
-    "cigarrillos": "https://example.com/images/cigarrillos.jpg",
-    "cuidado_personal": "https://example.com/images/cuidado_personal.jpg"
-}
-
-def get_example_image_url(section):
-    return EXAMPLE_IMAGES.get(section, "https://example.com/images/default.jpg")
-
-# ------------------------------------------------------------------------
-# 4. SLACK WEBHOOKS
-# ------------------------------------------------------------------------
-SLACK_WEBHOOK_URL = os.getenv("WEBHOOK_SLACK")
-
-def post_to_slack_onboarding(username, phone_number, webhook_url=SLACK_WEBHOOK_URL):
+def call_openai(messages, user_name):
+    """
+    Llama a la API de OpenAI usando el modelo gpt-4-turbo-preview
+    
+    Args:
+        messages: Lista de mensajes en formato de la API de OpenAI
+        user_name: Nombre del usuario para personalizar respuestas
+        
+    Returns:
+        Respuesta del asistente y datos JSON extraídos (si hay)
+    """
     try:
-        current_time = datetime.now().strftime('%d/%m/%Y %H:%M')
-        data = {
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": "🚀 NUEVO USUARIO EN ONBOARDING 🚀", "emoji": True}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": "*Se ha iniciado un nuevo proceso de onboarding...*"}},
-                {"type": "divider"},
-                {"type": "section", "fields": [
-                    {"type": "mrkdwn", "text": f"*Usuario:* `{username}`"},
-                    {"type": "mrkdwn", "text": f"*Teléfono:* `{phone_number}`"}
-                ]},
-                {"type": "section", "text": {"type": "mrkdwn", "text": "⏱️ *Estado:* Iniciando proceso de validación"}},
-                {"type": "divider"},
-                {"type": "context", "elements": [
-                    {"type": "mrkdwn", "text": f"📅 Fecha y hora: {current_time}"}
-                ]}
-            ]
-        }
-        resp = requests.post(webhook_url, json=data, headers={"Content-Type": "application/json"})
-        if resp.status_code != 200:
-            logger.error(f"Error Slack onboarding: {resp.status_code} {resp.text}")
-            return False
-        logger.info(f"Onboarding notificado para {username}")
-        return True
-    except Exception as e:
-        logger.error(f"Excepción Slack onboarding: {e}")
-        return False
-
-def post_to_slack_new_store(username, phone_number, client_info, store_type, webhook_url=SLACK_WEBHOOK_URL):
-    try:
-        current_time = datetime.now().strftime('%d/%m/%Y %H:%M')
-        canal = "Canal Moderno" if "supermercados" in store_type.lower() else "Canal Tradicional"
-        data = {
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": "🚨 ¡NUEVA TIENDA EN PROCESO! 🚨", "emoji": True}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"✨ El usuario {username} ha comenzado a registrar una nueva tienda ✨"}},
-                {"type": "divider"},
-                {"type": "section", "fields": [
-                    {"type": "mrkdwn", "text": f"*Usuario:* `{username}`"},
-                    {"type": "mrkdwn", "text": f"*Teléfono:* `{phone_number}`"}
-                ]},
-                {"type": "section", "fields": [
-                    {"type": "mrkdwn", "text": f"*Cliente:* `{client_info}`"},
-                    {"type": "mrkdwn", "text": f"*Canal:* `{canal}`"}
-                ]},
-                {"type": "section", "text": {"type": "mrkdwn", "text": "⏱️ *Estado:* En proceso de registro"}},
-                {"type": "divider"},
-                {"type": "context", "elements": [
-                    {"type": "mrkdwn", "text": f"📅 Fecha y hora: {current_time}"}
-                ]}
-            ]
-        }
-        resp = requests.post(webhook_url, json=data, headers={"Content-Type": "application/json"})
-        if resp.status_code != 200:
-            logger.error(f"Error Slack new store: {resp.status_code} {resp.text}")
-            return False
-        logger.info(f"Nueva tienda notificada para {username}")
-        return True
-    except Exception as e:
-        logger.error(f"Excepción Slack new store: {e}")
-        return False
-
-def post_to_slack_end_process(username, phone_number, total_time_str, webhook_url=SLACK_WEBHOOK_URL):
-    try:
-        current_time = datetime.now().strftime('%d/%m/%Y %H:%M')
-        data = {
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": "✅ FIN DEL PROCESO ✅", "emoji": True}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*El usuario {username} ha completado todo el proceso.*"}},
-                {"type": "divider"},
-                {"type": "section", "fields": [
-                    {"type": "mrkdwn", "text": f"*Usuario:* `{username}`"},
-                    {"type": "mrkdwn", "text": f"*Teléfono:* `{phone_number}`"},
-                    {"type": "mrkdwn", "text": f"*Tiempo total:* `{total_time_str}`"}
-                ]},
-                {"type": "section", "text": {"type": "mrkdwn", "text": "⏱️ *Estado:* Finalizado"}},
-                {"type": "divider"},
-                {"type": "context", "elements": [
-                    {"type": "mrkdwn", "text": f"📅 Fecha y hora: {current_time}"}
-                ]}
-            ]
-        }
-        resp = requests.post(webhook_url, json=data, headers={"Content-Type": "application/json"})
-        if resp.status_code != 200:
-            logger.error(f"Error Slack end process: {resp.status_code} {resp.text}")
-            return False
-        logger.info(f"Fin del proceso notificado para {username}")
-        return True
-    except Exception as e:
-        logger.error(f"Excepción Slack end process: {e}")
-        return False
-
-# ------------------------------------------------------------------------
-# 5. DB (shelve)
-# ------------------------------------------------------------------------
-def get_db():
-    return shelve.open("conversation_states")
-
-def get_conversation_state(wa_id):
-    with get_db() as db:
-        state = db.get(wa_id, None)
-        if state:
-            updated = False
-            if not hasattr(state, 'onboarding_notified'):
-                state.onboarding_notified = False
-                updated = True
-            if not hasattr(state, 'new_store_notified'):
-                state.new_store_notified = False
-                updated = True
-            if not hasattr(state, 'start_time'):
-                state.start_time = datetime.now()
-                updated = True
-            if not hasattr(state, 'end_notified'):
-                state.end_notified = False
-                updated = True
-            if not hasattr(state, 'conversation_id'):
-                state.conversation_id = f"conv_{uuid.uuid4()}"
-                updated = True
-            if updated:
-                db[wa_id] = state
-        return state
-
-def store_conversation_state(wa_id, state):
-    with get_db() as db:
-        if not hasattr(state, 'conversation_id'):
-            state.conversation_id = f"conv_{uuid.uuid4()}"
-        db[wa_id] = state
-
-# ------------------------------------------------------------------------
-# 6. CONVERSATION STATE
-# ------------------------------------------------------------------------
-class ConversationState:
-    def __init__(self, wa_id, name, channel=None, current_step="ONBOARDING", step_index=0):
-        self.wa_id = wa_id
-        self.name = name
-        self.channel = channel
-        self.current_step = current_step
-        self.step_index = step_index
-        self.data = {}  # Datos adicionales: store_name, store_address, store_location, etc.
-        self.photo_counts = {}
-        self.onboarding_notified = False
-        self.new_store_notified = False
-        self.start_time = datetime.now()
-        self.end_notified = False
-        self.conversation_id = f"conv_{uuid.uuid4()}"
-
-    def to_dict(self):
-        return {
-            'wa_id': self.wa_id,
-            'name': self.name,
-            'channel': self.channel,
-            'current_step': self.current_step,
-            'step_index': self.step_index,
-            'data': self.data,
-            'photo_counts': self.photo_counts,
-            'onboarding_notified': self.onboarding_notified,
-            'new_store_notified': self.new_store_notified,
-            'start_time': self.start_time.isoformat(),
-            'end_notified': self.end_notified,
-            'conversation_id': self.conversation_id
-        }
-
-    @classmethod
-    def from_dict(cls, d):
-        obj = cls(
-            d['wa_id'],
-            d['name'],
-            channel=d.get('channel'),
-            current_step=d.get('current_step', 'ONBOARDING'),
-            step_index=d.get('step_index', 0)
+        # Añadir información sobre el usuario al sistema prompt
+        personalized_prompt = SYSTEM_PROMPT.replace("{name}", user_name).replace("{agent_name}", "Kapta Assistant")
+        
+        response = client.chat.completions.create(
+            model="gpt-4-turbo-preview",
+            messages=[
+                {
+                    "role": "system",
+                    "content": personalized_prompt
+                }
+            ] + messages,
+            temperature=0.7,
         )
-        obj.data = d.get('data', {})
-        obj.photo_counts = d.get('photo_counts', {})
-        obj.onboarding_notified = d.get('onboarding_notified', False)
-        obj.new_store_notified = d.get('new_store_notified', False)
-        if d.get('start_time'):
-            obj.start_time = datetime.fromisoformat(d['start_time'])
-        else:
-            obj.start_time = datetime.now()
-        obj.end_notified = d.get('end_notified', False)
-        obj.conversation_id = d.get('conversation_id', f"conv_{uuid.uuid4()}")
-        return obj
-
-    def get_current_script(self):
-        return SCRIPT_CONTENT.get(self.current_step, [])
-
-    def get_current_message(self):
-        script = self.get_current_script()
-        if self.step_index < len(script):
-            return script[self.step_index].format(name=self.name)
-        return None
-
-    def notify_end_of_flow(self):
-        end_time = datetime.now()
-        total_time = end_time - self.start_time
-        total_time_str = str(total_time).split('.')[0]
-        post_to_slack_end_process(self.name, self.wa_id, total_time_str)
-        self.end_notified = True
-
-    def advance_step(self):
-        script = self.get_current_script()
-        if self.current_step == "ONBOARDING" and self.step_index == 1:
-            user_response = self.data.get('onboarding_response', '').lower()
-            if "supermercados" in user_response:
-                self.channel = "CANAL_MODERNO"
-            else:
-                self.channel = "CANAL_TRADICIONAL"
-            self.current_step = self.channel
-            self.step_index = 0
-            self.photo_counts = {}
-            return
-        if self.step_index < len(script) - 1:
-            self.step_index += 1
-            self.photo_counts = {}
-            if self.step_index == len(script) - 1 and not self.end_notified:
-                self.notify_end_of_flow()
-        else:
-            if not self.end_notified:
-                self.notify_end_of_flow()
-
-    def process_message(self, message_type, content=None):
-        # ---------------------------
-        # ONBOARDING
-        # ---------------------------
-        if self.current_step == "ONBOARDING":
-            if self.step_index == 0:
-                if message_type == "image" and content:
-                    self._upload_onboarding_image(content)
-                    self.advance_step()
-                    return True
-            elif self.step_index == 1:
-                if message_type == "text":
-                    self.data['onboarding_response'] = content
-                    if not self.new_store_notified:
-                        self._maybe_notify_new_store(content)
-                    self.advance_step()
-                    return True
-
-        # ---------------------------
-        # CANAL TRADICIONAL
-        # ---------------------------
-        elif self.current_step == "CANAL_TRADICIONAL":
-            if self.step_index == 0:
-                self.advance_step()
-                return True
-            elif self.step_index == 1:
-                if message_type == "text":
-                    self.data['store_name'] = content.strip()
-                    self._upload_conversation_json()
-                    self.advance_step()
-                    return True
-            elif self.step_index == 2:
-                if message_type == "text":
-                    self.data['store_address'] = content.strip()
-                    self._upload_conversation_json()
-                    self.advance_step()
-                    return True
-            elif self.step_index == 3:
-                if message_type in ("location", "text"):
-                    loc = {}
-                    if isinstance(content, dict):
-                        loc = content
-                    else:
-                        try:
-                            loc = json.loads(content)
-                        except Exception:
-                            loc = {}
-                    lat = loc.get("latitude")
-                    lng = loc.get("longitude")
-                    if lat is not None and lng is not None:
-                        self.data['store_location'] = {"latitude": lat, "longitude": lng}
-                        self._upload_conversation_json()
-                        self.advance_step()
-                        return True
-                    else:
-                        logger.info("No se detectó latitud/longitud. Por favor, envía la ubicación de WhatsApp.")
-                        return False
-            elif self.step_index >= 4:
-                sections = [
-                    'fachada', 'bebidas_alcoholicas', 'bebidas_no_alcoholicas',
-                    'snacks', 'huevos', 'cigarrillos', 'cuidado_personal', 'audio'
-                ]
-                idx = self.step_index - 4
-                if idx < len(sections):
-                    section = sections[idx]
-                    if message_type == ("audio" if section == "audio" else "image"):
-                        if section != "audio" and content:
-                            if section == "fachada":
-                                self._upload_fachada_image(content)
-                                self.photo_counts[section] = self.photo_counts.get(section, 0) + 1
-                                if self.photo_counts[section] >= 1:
-                                    self.advance_step()
-                                    return True
-                            else:
-                                self._upload_product_image(content, section)
-                                self.photo_counts[section] = self.photo_counts.get(section, 0) + 1
-                                if self.photo_counts[section] >= 3:
-                                    self.advance_step()
-                                    return True
-                            return False
-                        else:
-                            self.advance_step()
-                            return True
-                return False
-
-        # ---------------------------
-        # CANAL MODERNO
-        # ---------------------------
-        elif self.current_step == "CANAL_MODERNO":
-            if self.step_index == 0:
-                self.advance_step()
-                return True
-            elif self.step_index == 1:
-                if message_type == "text":
-                    self.data['store_name'] = content.strip()
-                    self._upload_conversation_json()
-                    self.advance_step()
-                    return True
-            elif self.step_index == 2:
-                if message_type == "text":
-                    self.data['store_address'] = content.strip()
-                    self._upload_conversation_json()
-                    self.advance_step()
-                    return True
-            elif self.step_index == 3:
-                if message_type in ("location", "text"):
-                    logger.info(f"Ubicación recibida: {content}")
-                    loc = {}
-                    if isinstance(content, dict):
-                        loc = content
-                    else:
-                        try:
-                            loc = json.loads(content)
-                        except Exception:
-                            loc = {}
-                    lat = loc.get("latitude")
-                    lng = loc.get("longitude")
-                    if lat is None or lng is None:
-                        logger.info("No se detectaron latitud y/o longitud. Envía la ubicación real de WhatsApp.")
-                        return False
-                    if not loc.get("name") or not loc.get("address"):
-                        logger.info("Falta nombre y/o dirección en la ubicación. Por favor, envía un mensaje de texto con 'Nombre: X, Dirección: Y'.")
-                        return False
-                    self.data['store_location'] = {
-                        "latitude": lat,
-                        "longitude": lng,
-                        "name": loc.get("name"),
-                        "address": loc.get("address")
-                    }
-                    self._upload_conversation_json()
-                    self.advance_step()
-                    return True
-            elif self.step_index >= 4:
-                sections = [
-                    'bebidas_alcoholicas', 'bebidas_no_alcoholicas',
-                    'snacks', 'huevos', 'cigarrillos', 'cuidado_personal', 'audio'
-                ]
-                idx = self.step_index - 4
-                if idx < len(sections):
-                    section = sections[idx]
-                    if message_type == ("audio" if section == "audio" else "image"):
-                        if section != "audio" and content:
-                            self._upload_product_image(content, section)
-                            self.photo_counts[section] = self.photo_counts.get(section, 0) + 1
-                            if self.photo_counts[section] >= 3:
-                                self.advance_step()
-                                return True
-                            return False
-                        else:
-                            self.advance_step()
-                            return True
-                return False
-
-        return False
-
-    def _maybe_notify_new_store(self, content):
-        cliente = "No especificado"
-        visita = "No especificado"
-        if "cliente" in content.lower() and "trabajo" in content.lower():
-            lines = content.split('\n')
-            for i, line in enumerate(lines):
-                if "cliente" in line.lower() and i + 1 < len(lines):
-                    cliente = lines[i+1].strip()
-                    break
-        if "supermercados" in content.lower():
-            visita = "Principalmente supermercados"
-        elif "tienda" in content.lower():
-            visita = "Principalmente tiendas de barrio"
-        post_to_slack_new_store(self.name, self.wa_id, cliente, visita)
-        self.new_store_notified = True
-
-    def _upload_onboarding_image(self, image_url):
-        img_bytes = download_image_bytes(image_url)
-        if not img_bytes:
-            logger.error(f"Imagen vacía al descargar desde {image_url}")
-            return
-        file_name = f"onboarding/{self.conversation_id}_cedula.jpg"
-        upload_bytes_to_gcs(file_name, img_bytes)
-        json_name = f"onboarding/{self.conversation_id}_conversation.json"
-        upload_json_to_gcs(json_name, self.to_dict())
-
-    def _upload_fachada_image(self, image_url):
-        img_bytes = download_image_bytes(image_url)
-        if not img_bytes:
-            logger.error(f"Imagen vacía al descargar desde {image_url}")
-            return
-        store_name = self.data.get('store_address', 'no_name').replace(' ', '_')
-        store_id = f"store_{uuid.uuid4()}"
-        file_name = f"stores/{store_name}_{store_id}/{self.conversation_id}_fachada.jpg"
-        upload_bytes_to_gcs(file_name, img_bytes)
-        json_name = f"stores/{store_name}_{store_id}/{self.conversation_id}_conversation.json"
-        upload_json_to_gcs(json_name, self.to_dict())
-
-    def _upload_product_image(self, image_url, section):
-        img_bytes = download_image_bytes(image_url)
-        if not img_bytes:
-            logger.error(f"Imagen vacía al descargar desde {image_url}")
-            return
-        random_id = uuid.uuid4()
-        file_name = f"products/{section}/{self.conversation_id}_{random_id}.jpg"
-        upload_bytes_to_gcs(file_name, img_bytes)
-        json_name = f"products/{section}/{self.conversation_id}_conversation.json"
-        upload_json_to_gcs(json_name, self.to_dict())
-
-    def _upload_conversation_json(self):
-        json_name = f"onboarding/{self.conversation_id}_conversation.json"
-        upload_json_to_gcs(json_name, self.to_dict())
-        logger.info(f"Conversación actualizada en {json_name}")
+        
+        # Extraer respuesta
+        assistant_response = response.choices[0].message.content
+        
+        # Verificar si hay JSON en la respuesta y extraerlo silenciosamente
+        json_data = {}
+        json_match = re.search(r'```json\s*(.*?)\s*```', assistant_response, re.DOTALL)
+        if json_match:
+            try:
+                json_str = json_match.group(1)
+                json_data = json.loads(json_str)
+                # Eliminar el JSON de la respuesta que se mostrará al usuario
+                assistant_response = re.sub(r'```json\s*.*?\s*```', '', assistant_response, flags=re.DOTALL)
+                logger.info("JSON extraído de la respuesta y eliminado del texto visible")
+            except:
+                logger.warning("Se encontró formato de JSON pero no se pudo parsear")
+        
+        # Limpiar cualquier otro bloque de código que pudiera haberse colado
+        assistant_response = re.sub(r'```.*?```', '', assistant_response, flags=re.DOTALL)
+        
+        # Asegurarse de que no haya mensajes técnicos o debugging
+        assistant_response = re.sub(r'\[DEBUG:.*?\]', '', assistant_response)
+        assistant_response = re.sub(r'\[INTERNAL:.*?\]', '', assistant_response)
+        
+        # Añadir emojis si no hay suficientes
+        if assistant_response.count('😊🙂😀😄😁😃🤗👋👍✅🎉🏪🛒📸📱📍🗺️🎤🔊') < 2:
+            common_emojis = ['😊', '👋', '📸', '📍', '🎤', '✅', '🎉', '👍', '💯', '⭐']
+            emoji_count = sum(1 for char in assistant_response if ord(char) > 127)
+            if emoji_count < 2:
+                if not any(ord(char) > 127 for char in assistant_response[:10]):
+                    assistant_response = f"{random.choice(common_emojis)} {assistant_response}"
+                if not any(ord(char) > 127 for char in assistant_response[-10:]):
+                    assistant_response = f"{assistant_response} {random.choice(common_emojis)}"
+        
+        return assistant_response, json_data
+    except Exception as e:
+        logger.error(f"Error llamando a OpenAI: {e}", exc_info=True)
+        return "😕 Lo siento, ocurrió un error al procesar tu solicitud. Por favor, inténtalo de nuevo más tarde. 🙏", {}
 
 # ------------------------------------------------------------------------
-# 7. LÓGICA PRINCIPAL DE RESPUESTA
+# GENERAR RESPUESTA
 # ------------------------------------------------------------------------
 def generate_response(wa_id, name, message_type, message_content=None):
+    """
+    Procesa un mensaje de WhatsApp y genera una respuesta usando el modelo o1.
+    Ahora incluye procesamiento de documentos y guardado en Cloud Storage.
+    """
     try:
-        state = get_conversation_state(wa_id)
-        if not state:
-            state = ConversationState(wa_id, name)
-            logger.info(f"Enviando notificación ONBOARDING para {name} ({wa_id})")
-            post_to_slack_onboarding(name, wa_id)
-            state.onboarding_notified = True
-            store_conversation_state(wa_id, state)
-
-        state.process_message(message_type, message_content)
-
-        response_data = {
-            'text_response': state.get_current_message(),
-            'force_script': True
-        }
-
-        store_conversation_state(wa_id, state)
-        return response_data
-
-    except Exception as e:
-        logger.error(f"Error crítico en generate_response: {e}")
-        error_response = f"Hola {name}, estamos experimentando problemas técnicos. Por favor, intenta más tarde."
-        message_handler.add_message(wa_id, error_response, is_bot=True)
+        if not OPENAI_API_KEY:
+            error_msg = "😕 Error de configuración: No se puede conectar con el asistente."
+            logger.error(f"No hay API key configurada para usuario {name} ({wa_id})")
+            return {"text_response": error_msg, "force_script": True}
+        
+        # Obtener historial y datos del usuario
+        conversation_history = get_conversation_history(wa_id)
+        user_data = get_user_data(wa_id)
+        
+        # Crear un ID único para la conversación si es nueva
+        if "conversation_id" not in user_data:
+            user_data["conversation_id"] = str(uuid.uuid4())
+            store_user_data(wa_id, user_data)
+        
+        if not conversation_history:
+            logger.info(f"Nueva conversación para {name} ({wa_id})")
+            conversation_history.append({
+                "role": "system", 
+                "content": f"Nueva conversación con {name}. Esta es la primera interacción del usuario."
+            })
+        
+        user_message = ""
+        docai_results = None
+        
+        # Procesamiento según el tipo de mensaje
+        if message_type == "text":
+            user_message = message_content
+            logger.info(f"Mensaje de texto a procesar: {message_content[:50]}...")
+            if "listo" in user_message.lower() or "terminado" in user_message.lower():
+                user_data["conversation_complete"] = True
+                store_user_data(wa_id, user_data)
+                
+        elif message_type == "image":
+            image_bytes = download_image_bytes(message_content)
+            if image_bytes:
+                image_size = len(image_bytes) / 1024  # KB
+                # Procesar con Document AI si es parte del onboarding de documento
+                if user_data.get("onboarding_phase") == "document_upload":
+                    docai_results = process_document_with_docai(image_bytes)
+                    if docai_results["success"]:
+                        user_message = "[📸 Documento de identidad procesado]"
+                        if "documents" not in user_data:
+                            user_data["documents"] = []
+                        user_data["documents"].append({
+                            "type": "identification",
+                            "text": docai_results["text"],
+                            "entities": docai_results["entities"],
+                            "timestamp": time.time()
+                        })
+                        user_data["onboarding_phase"] = "document_processed"
+                    else:
+                        user_message = "[📸 Error al procesar documento. Por favor, inténtalo de nuevo]"
+                else:
+                    user_message = f"[📸 Imagen recibida ({image_size:.1f}KB)]"
+                
+                if "images" not in user_data:
+                    user_data["images"] = []
+                user_data["images"].append({
+                    "timestamp": time.time(),
+                    "size_kb": round(image_size, 1),
+                    "url": message_content,
+                    "docai_processed": bool(docai_results and docai_results["success"])
+                })
+                store_user_data(wa_id, user_data)
+            else:
+                user_message = "[📷 Error al recibir imagen]"
+                logger.warning("No se pudo descargar la imagen")
+                
+        # En la sección de procesamiento de mensajes de audio en generate_response
+        elif message_type == "audio":
+            user_message = "[🎤 Audio recibido]"
+            if "audio_messages" not in user_data:
+                user_data["audio_messages"] = []
+            
+            audio_info = {
+                "timestamp": time.time(),
+                "url": message_content,
+                "processed": False
+            }
+            user_data["audio_messages"].append(audio_info)
+            store_user_data(wa_id, user_data)
+            
+            # Si ya se guardó el audio en GCS en conversaciones anteriores, usar esa URL
+            audio_gcs_url = None
+            for audio in user_data.get("audio_messages", []):
+                if audio.get("url") == message_content and "gcs_url" in audio:
+                    audio_gcs_url = audio.get("gcs_url")
+                    break
+            
+            # Si tenemos URL de GCS, añadirla al mensaje del usuario
+            if audio_gcs_url:
+                user_message = f"[🎤 Audio recibido - {audio_gcs_url}]"
+            
+            logger.info(f"Audio recibido y referencia almacenada: {message_content}")
+            
+        elif message_type == "location":
+            try:
+                loc = json.loads(message_content) if isinstance(message_content, str) else message_content
+                user_message = f"""[📍 Ubicación recibida]
+Latitud: {loc.get('latitude')}
+Longitud: {loc.get('longitude')}
+Nombre: {loc.get('name', 'No disponible')}
+Dirección: {loc.get('address', 'No disponible')}
+"""
+                user_data["location"] = {
+                    "latitude": loc.get("latitude"),
+                    "longitude": loc.get("longitude"),
+                    "name": loc.get("name"),
+                    "address": loc.get("address"),
+                    "timestamp": time.time()
+                }
+                store_user_data(wa_id, user_data)
+                logger.info("Ubicación almacenada")
+            except Exception as e:
+                logger.error(f"Error procesando ubicación: {e}")
+                user_message = "[🗺️ Ubicación recibida (error al procesar detalles)]"
+                
+        else:
+            user_message = f"[Tipo de mensaje recibido: {message_type}]"
+            logger.info(f"Mensaje de tipo no estándar recibido: {message_type}")
+        
+        conversation_history.append({"role": "user", "content": user_message})
+        
+        assistant_response, json_data = call_openai(conversation_history, name)
+        conversation_history.append({"role": "assistant", "content": assistant_response})
+        store_conversation_history(wa_id, conversation_history)
+        
+        if json_data:
+            if "captures" not in user_data:
+                user_data["captures"] = []
+            json_data["timestamp"] = time.time()
+            user_data["captures"].append(json_data)
+            for key, value in json_data.items():
+                if key not in ["captures", "timestamp"]:
+                    user_data[key] = value
+            store_user_data(wa_id, user_data)
+        
+        # Guardar en Cloud Storage si la conversación está completa
+        if user_data.get("conversation_complete"):
+            conversation_id = user_data["conversation_id"]
+            save_results = save_conversation_to_cloud(wa_id, conversation_id)
+            if save_results:
+                logger.info(f"Conversación guardada en GCS: {save_results['gcs_path']}")
+                # Opcional: aquí se puede limpiar la información local si fuera necesario
+        
+        if len(assistant_response) > 0 and sum(1 for c in assistant_response if ord(c) > 127) < 2:
+            emojis = ["😊", "👍", "👋", "🎉", "✅"]
+            assistant_response = f"{random.choice(emojis)} {assistant_response}"
+        
         return {
-            'text_response': error_response,
-            'force_script': True
+            "text_response": assistant_response,
+            "force_script": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error en generate_response: {e}", exc_info=True)
+        return {
+            "text_response": f"😕 Lo siento {name}, ocurrió un problema. Por favor, inténtalo de nuevo más tarde. 🙏",
+            "force_script": True
         }
